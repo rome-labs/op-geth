@@ -19,7 +19,6 @@ package core
 import (
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -67,61 +66,7 @@ func (result *ExecutionResult) Revert() []byte {
 
 // IntrinsicGas computes the 'intrinsic gas' for a message with the given data.
 func IntrinsicGas(data []byte, accessList types.AccessList, isContractCreation bool, isHomestead, isEIP2028 bool, isEIP3860 bool) (uint64, error) {
-	// Set the starting gas for the raw transaction
-	var gas uint64
-	if isContractCreation && isHomestead {
-		gas = params.TxGasContractCreation
-	} else {
-		gas = params.TxGas
-	}
-	dataLen := uint64(len(data))
-	// Bump the required gas by the amount of transactional data
-	if dataLen > 0 {
-		// Zero and non-zero bytes are priced differently
-		var nz uint64
-		for _, byt := range data {
-			if byt != 0 {
-				nz++
-			}
-		}
-		// Make sure we don't exceed uint64 for all data combinations
-		nonZeroGas := params.TxDataNonZeroGasFrontier
-		if isEIP2028 {
-			nonZeroGas = params.TxDataNonZeroGasEIP2028
-		}
-		if (math.MaxUint64-gas)/nonZeroGas < nz {
-			return 0, ErrGasUintOverflow
-		}
-		gas += nz * nonZeroGas
-
-		z := dataLen - nz
-		if (math.MaxUint64-gas)/params.TxDataZeroGas < z {
-			return 0, ErrGasUintOverflow
-		}
-		gas += z * params.TxDataZeroGas
-
-		if isContractCreation && isEIP3860 {
-			lenWords := toWordSize(dataLen)
-			if (math.MaxUint64-gas)/params.InitCodeWordGas < lenWords {
-				return 0, ErrGasUintOverflow
-			}
-			gas += lenWords * params.InitCodeWordGas
-		}
-	}
-	if accessList != nil {
-		gas += uint64(len(accessList)) * params.TxAccessListAddressGas
-		gas += uint64(accessList.StorageKeys()) * params.TxAccessListStorageKeyGas
-	}
-	return gas, nil
-}
-
-// toWordSize returns the ceiled word size required for init code payment calculation.
-func toWordSize(size uint64) uint64 {
-	if size > math.MaxUint64-31 {
-		return math.MaxUint64/32 + 1
-	}
-
-	return (size + 31) / 32
+	return 0, nil
 }
 
 // A Message contains the data derived from a single transaction that is relevant to state
@@ -188,8 +133,8 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 // the gas used (which includes gas refunds) and an error if it failed. An error always
 // indicates a core error meaning that the message would always fail for that particular
 // state and would never be accepted within a block.
-func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
-	return NewStateTransition(evm, msg, gp).TransitionDb()
+func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool, romeGasUsed uint64) (*ExecutionResult, error) {
+	return NewStateTransition(evm, msg, gp).TransitionDb(romeGasUsed)
 }
 
 // StateTransition represents a state transition.
@@ -281,7 +226,12 @@ func (st *StateTransition) buyGas() error {
 	st.gasRemaining += st.msg.GasLimit
 
 	st.initialGas = st.msg.GasLimit
-	st.state.SubBalance(st.msg.From, mgval)
+
+	zeroAddress := common.Address{}
+	if st.evm.Context.Coinbase != zeroAddress {
+		st.state.SubBalance(st.msg.From, mgval)
+	}
+
 	return nil
 }
 
@@ -321,31 +271,6 @@ func (st *StateTransition) preCheck() error {
 		if codeHash != (common.Hash{}) && codeHash != types.EmptyCodeHash {
 			return fmt.Errorf("%w: address %v, codehash: %s", ErrSenderNoEOA,
 				msg.From.Hex(), codeHash)
-		}
-	}
-	// Make sure that transaction gasFeeCap is greater than the baseFee (post london)
-	if st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
-		// Skip the checks if gas fields are zero and baseFee was explicitly disabled (eth_call)
-		skipCheck := st.evm.Config.NoBaseFee && msg.GasFeeCap.BitLen() == 0 && msg.GasTipCap.BitLen() == 0
-		if !skipCheck {
-			if l := msg.GasFeeCap.BitLen(); l > 256 {
-				return fmt.Errorf("%w: address %v, maxFeePerGas bit length: %d", ErrFeeCapVeryHigh,
-					msg.From.Hex(), l)
-			}
-			if l := msg.GasTipCap.BitLen(); l > 256 {
-				return fmt.Errorf("%w: address %v, maxPriorityFeePerGas bit length: %d", ErrTipVeryHigh,
-					msg.From.Hex(), l)
-			}
-			if msg.GasFeeCap.Cmp(msg.GasTipCap) < 0 {
-				return fmt.Errorf("%w: address %v, maxPriorityFeePerGas: %s, maxFeePerGas: %s", ErrTipAboveFeeCap,
-					msg.From.Hex(), msg.GasTipCap, msg.GasFeeCap)
-			}
-			// This will panic if baseFee is nil, but basefee presence is verified
-			// as part of header validation.
-			if msg.GasFeeCap.Cmp(st.evm.Context.BaseFee) < 0 {
-				return fmt.Errorf("%w: address %v, maxFeePerGas: %s, baseFee: %s", ErrFeeCapTooLow,
-					msg.From.Hex(), msg.GasFeeCap, st.evm.Context.BaseFee)
-			}
 		}
 	}
 	// Check the blob version validity
@@ -388,13 +313,13 @@ func (st *StateTransition) preCheck() error {
 //
 // However if any consensus issue encountered, return the error directly with
 // nil evm execution result.
-func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
+func (st *StateTransition) TransitionDb(romeGasUsed uint64) (*ExecutionResult, error) {
 	if mint := st.msg.Mint; mint != nil {
 		st.state.AddBalance(st.msg.From, mint)
 	}
 	snap := st.state.Snapshot()
 
-	result, err := st.innerTransitionDb()
+	result, err := st.innerTransitionDb(romeGasUsed)
 	// Failed deposits must still be included. Unless we cannot produce the block at all due to the gas limit.
 	// On deposit failure, we rewind any state changes from after the minting, and increment the nonce.
 	if err != nil && err != ErrGasLimitReached && st.msg.IsDepositTx {
@@ -419,7 +344,7 @@ func (st *StateTransition) TransitionDb() (*ExecutionResult, error) {
 	return result, err
 }
 
-func (st *StateTransition) innerTransitionDb() (*ExecutionResult, error) {
+func (st *StateTransition) innerTransitionDb(romeGasUsed uint64) (*ExecutionResult, error) {
 	// First check this message satisfies all consensus rules before
 	// applying the message. The rules include these clauses
 	//
@@ -491,39 +416,25 @@ func (st *StateTransition) innerTransitionDb() (*ExecutionResult, error) {
 	if st.msg.IsDepositTx && !rules.IsOptimismRegolith {
 		// Record deposits as using all their gas (matches the gas pool)
 		// System Transactions are special & are not recorded as using any gas (anywhere)
-		gasUsed := st.msg.GasLimit
-		if st.msg.IsSystemTx {
-			gasUsed = 0
-		}
 		return &ExecutionResult{
-			UsedGas:    gasUsed,
+			UsedGas:    romeGasUsed,
 			Err:        vmerr,
 			ReturnData: ret,
 		}, nil
 	}
-	// Note for deposit tx there is no ETH refunded for unused gas, but that's taken care of by the fact that gasPrice
-	// is always 0 for deposit tx. So calling refundGas will ensure the gasUsed accounting is correct without actually
-	// changing the sender's balance
-	var gasRefund uint64
-	if !rules.IsLondon {
-		// Before EIP-3529: refunds were capped to gasUsed / 2
-		gasRefund = st.refundGas(params.RefundQuotient)
-	} else {
-		// After EIP-3529: refunds are capped to gasUsed / 5
-		gasRefund = st.refundGas(params.RefundQuotientEIP3529)
-	}
 	if st.msg.IsDepositTx && rules.IsOptimismRegolith {
 		// Skip coinbase payments for deposit tx in Regolith
 		return &ExecutionResult{
-			UsedGas:     st.gasUsed(),
-			RefundedGas: gasRefund,
+			UsedGas:     romeGasUsed,
+			RefundedGas: 0,
 			Err:         vmerr,
 			ReturnData:  ret,
 		}, nil
 	}
+
 	effectiveTip := msg.GasPrice
 	if rules.IsLondon {
-		effectiveTip = cmath.BigMin(msg.GasTipCap, new(big.Int).Sub(msg.GasFeeCap, st.evm.Context.BaseFee))
+		effectiveTip = msg.GasTipCap
 	}
 
 	if st.evm.Config.NoBaseFee && msg.GasFeeCap.Sign() == 0 && msg.GasTipCap.Sign() == 0 {
@@ -531,9 +442,12 @@ func (st *StateTransition) innerTransitionDb() (*ExecutionResult, error) {
 		// are 0. This avoids a negative effectiveTip being applied to
 		// the coinbase when simulating calls.
 	} else {
-		fee := new(big.Int).SetUint64(st.gasUsed())
+		fee := new(big.Int).SetUint64(romeGasUsed)
 		fee.Mul(fee, effectiveTip)
-		st.state.AddBalance(st.evm.Context.Coinbase, fee)
+		zeroAddress := common.Address{}
+		if st.evm.Context.Coinbase != zeroAddress {
+			st.state.AddBalance(st.evm.Context.Coinbase, fee)
+		}
 	}
 
 	// Check that we are post bedrock to enable op-geth to be able to create pseudo pre-bedrock blocks (these are pre-bedrock, but don't follow l2 geth rules)
@@ -546,8 +460,8 @@ func (st *StateTransition) innerTransitionDb() (*ExecutionResult, error) {
 	}
 
 	return &ExecutionResult{
-		UsedGas:     st.gasUsed(),
-		RefundedGas: gasRefund,
+		UsedGas:     romeGasUsed,
+		RefundedGas: 0,
 		Err:         vmerr,
 		ReturnData:  ret,
 	}, nil
@@ -563,11 +477,14 @@ func (st *StateTransition) refundGas(refundQuotient uint64) uint64 {
 
 	// Return ETH for remaining gas, exchanged at the original rate.
 	remaining := new(big.Int).Mul(new(big.Int).SetUint64(st.gasRemaining), st.msg.GasPrice)
-	st.state.AddBalance(st.msg.From, remaining)
+	zeroAddress := common.Address{}
+	if st.evm.Context.Coinbase != zeroAddress {
+		st.state.AddBalance(st.msg.From, remaining)
+	}
 
 	// Also return remaining gas to the block gas counter so it is
 	// available for the next transaction.
-	st.gp.AddGas(st.gasRemaining)
+	//st.gp.AddGas(st.gasRemaining)
 
 	return refund
 }
