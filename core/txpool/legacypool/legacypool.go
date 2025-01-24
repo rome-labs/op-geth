@@ -369,25 +369,21 @@ func (pool *LegacyPool) loop() {
 			pending, queued := pool.stats()
 			pool.mu.RUnlock()
 			stales := int(pool.priced.stales.Load())
-
+			log.Info("Transaction pool status report", "executable", pending)
 			if pending != prevPending || queued != prevQueued || stales != prevStales {
-				log.Debug("Transaction pool status report", "executable", pending, "queued", queued, "stales", stales)
+				log.Info("Transaction pool status report", "executable", pending, "queued", queued, "stales", stales)
 				prevPending, prevQueued, prevStales = pending, queued, stales
 			}
 
-		// Handle inactive account transaction eviction
 		case <-evict.C:
 			pool.mu.Lock()
-			for addr := range pool.queue {
-				// Skip local transactions from the eviction mechanism
-				if pool.locals.contains(addr) {
-					continue
-				}
-				// Any non-locals old enough should be removed
+			for addr := range pool.pending {
+				log.Info("inside tx pool", "addr", addr)
 				if time.Since(pool.beats[addr]) > pool.config.Lifetime {
-					list := pool.queue[addr].Flatten()
+					list := pool.pending[addr].Flatten()
 					for _, tx := range list {
 						pool.removeTx(tx.Hash(), true, true)
+						log.Info("removed tx", "hash", tx.Hash())
 					}
 					queuedEvictionMeter.Mark(int64(len(list)))
 				}
@@ -1481,6 +1477,7 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address) []*types.T
 		}
 		log.Trace("Removed old queued transactions", "count", len(forwards))
 		balance := pool.currentState.GetBalance(addr)
+		log.Trace("Balance beforel1CostFn ", "balance:", balance)
 		if !list.Empty() && pool.l1CostFn != nil {
 			// Reduce the cost-cap by L1 rollup cost of the first tx if necessary. Other txs will get filtered out afterwards.
 			el := list.txs.FirstElement()
@@ -1489,12 +1486,15 @@ func (pool *LegacyPool) promoteExecutables(accounts []common.Address) []*types.T
 			}
 		}
 		// Drop all transactions that are too costly (low balance or out of gas)
+		log.Trace("In filter function", "l.costcap: ", list.costcap, ";l.gascap: ", list.gascap, ";balance:", balance, ";gasLimit:", gasLimit)
+
 		drops, _ := list.Filter(balance, gasLimit)
 		for _, tx := range drops {
 			hash := tx.Hash()
+			log.Trace("Removing unpayable queued transactions ", "Transaction hash", hash, "balance", balance, "gasLimit", gasLimit, "tx.gas", tx.Gas(), "tx.Cost()", tx.Cost())
 			pool.all.Remove(hash)
 		}
-		log.Trace("Removed unpayable queued transactions", "count", len(drops))
+		log.Trace("Removed unpayable queued transactions", "count", len(drops), "balance", balance, "gasLimit", gasLimit)
 		queuedNofundsMeter.Mark(int64(len(drops)))
 
 		// Gather all executable transactions and promote them
