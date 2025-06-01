@@ -28,6 +28,8 @@ import (
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/tyler-smith/go-bip39"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts"
@@ -1370,6 +1372,12 @@ func (s *BlockChainAPI) EstimateGas(ctx context.Context, args TransactionArgs, b
 
 // Fetch gas estimate from Rome gasometer
 func estimateRomeGas(ctx context.Context, args TransactionArgs) (hexutil.Uint64, error) {
+	tracer := log.GetTracer()
+	_, span := tracer.Start(ctx, "estimateRomeGas",
+		trace.WithAttributes(
+			attribute.String("timestamp", time.Now().Format(time.RFC3339Nano)),
+		))
+	defer span.End()
 	gasometerUrl := os.Getenv("ROME_GASOMETER_URL")
 	if gasometerUrl == "" {
 		return 0, fmt.Errorf("ROME_GASOMETER_URL ennvar is not set")
@@ -2021,6 +2029,14 @@ func (s *TransactionAPI) sign(addr common.Address, tx *types.Transaction) (*type
 
 // SubmitTransaction is a helper function that submits tx to txPool and logs a message.
 func SubmitTransaction(ctx context.Context, b Backend, tx *types.Transaction) (common.Hash, error) {
+	tracer := log.GetTracer()
+	_, span := tracer.Start(ctx, "SubmitTransaction",
+		trace.WithAttributes(
+			attribute.String("tx_hash", tx.Hash().Hex()),
+			attribute.String("timestamp", time.Now().Format(time.RFC3339Nano)),
+		))
+	defer span.End()
+
 	// If the transaction fee cap is already specified, ensure the
 	// fee of the given transaction is _reasonable_.
 	if err := checkTxFee(tx.GasPrice(), tx.Gas(), b.RPCTxFeeCap()); err != nil {
@@ -2106,6 +2122,65 @@ func (s *TransactionAPI) SendRawTransaction(ctx context.Context, input hexutil.B
 	if err := tx.UnmarshalBinary(input); err != nil {
 		return common.Hash{}, err
 	}
+
+	signer := types.LatestSignerForChainID(tx.ChainId())
+	fromAddr, err := types.Sender(signer, tx)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("could not recover sender: %w", err)
+	}
+	from := &fromAddr
+
+	var to *common.Address
+	if tx.To() != nil {
+		addr := *tx.To()
+		to = &addr
+	}
+
+	data := hexutil.Bytes(tx.Data())
+	gas := hexutil.Uint64(tx.Gas())
+	nonce := hexutil.Uint64(tx.Nonce())
+	chainID := (*hexutil.Big)(tx.ChainId())
+
+	var (
+		gasPrice             *hexutil.Big
+		maxFeePerGas         *hexutil.Big
+		maxPriorityFeePerGas *hexutil.Big
+	)
+	if tx.Type() == types.LegacyTxType {
+		gasPrice = (*hexutil.Big)(tx.GasPrice())
+	} else {
+		maxFeePerGas = (*hexutil.Big)(tx.GasFeeCap())
+		maxPriorityFeePerGas = (*hexutil.Big)(tx.GasTipCap())
+	}
+
+	accessList := tx.AccessList()
+
+	gasArgs := TransactionArgs{
+		From:                 from,
+		To:                   to,
+		Gas:                  &gas,
+		GasPrice:             gasPrice,
+		MaxFeePerGas:         maxFeePerGas,
+		MaxPriorityFeePerGas: maxPriorityFeePerGas,
+		Value:                (*hexutil.Big)(tx.Value()),
+		Nonce:                &nonce,
+		Data:                 &data,
+		AccessList:           &accessList,
+		ChainID:              chainID,
+	}
+
+	estGas, err := estimateRomeGas(ctx, gasArgs)
+	if err != nil {
+		return common.Hash{}, fmt.Errorf("rome gas estimate failed: %w", err)
+	}
+	if estGas > gas {
+		return common.Hash{}, fmt.Errorf(
+			"insufficient gas: provided %d but estimated %d is required",
+			gas,
+			estGas,
+		)
+	}
+	log.Info("Rome gas estimate:", "gas", uint64(estGas))
 
 	return SubmitTransaction(ctx, s.b, tx)
 }
